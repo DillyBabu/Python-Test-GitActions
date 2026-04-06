@@ -15,9 +15,10 @@ jobs:
 
 
       - name: Set up Python 3.14
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.14'
+          cache: 'pip'
       
       - name: Install dependencies
         shell: powershell
