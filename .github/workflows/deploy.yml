@@ -21,7 +21,7 @@ permissions:
 
 env:
   IMAGE_NAME: github-gists-api
-  CONTAINER_NAME: github-gists-api-${image_tag}
+  CONTAINER_NAME: github-gists-container
   CONTAINER_PORT: 8080
 
 jobs:
