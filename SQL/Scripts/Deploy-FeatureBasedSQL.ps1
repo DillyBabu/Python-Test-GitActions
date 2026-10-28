@@ -623,220 +623,304 @@ function Execute-Feature {
             switch ($RollbackStrategy) {
                 'AtomicFeature' {
                     Write-ScriptExecution "AtomicFeature rollback triggered" "Rollback"
-                    Invoke-FeatureRollback -FeatureScripts $sortedScripts -ApplicationName $ApplicationName -FeatureName $FeatureName
-                    return $false
+                    # Tracks clients that have already failed a script within this feature.
+                    # In ContinueOnClientFailure mode, all subsequent scripts for a failed client
+                    # are auto-skipped — preserving the prerequisite chain without blocking other clients.
+                    $failedClients = [System.Collections.Generic.HashSet[string]]::new(
+                        [System.StringComparer]::OrdinalIgnoreCase
+                    )
+
+                    # Sort scripts by script order (all scripts for Script_Order=1 run first, then =2, etc.)
+                    $sortedScripts = $FeatureScripts | Sort-Object { [int]$_.Script_Order }
+
+                    foreach ($script in $sortedScripts) {
+
+                        # ── ContinueOnClientFailure: prerequisite guard ──────────────────────────
+                        # If this client already failed an earlier script in this feature, skip all
+                        # remaining scripts for it without executing — prerequisite chain is broken.
+                        if ($ClientResilienceMode -eq "ContinueOnClientFailure" -and
+                            $failedClients.Contains($script.Client_Name)) {
+
+                            Write-ScriptExecution "[SKIPPED] '$($script.Script_Name)' for client '$($script.Client_Name)' - prerequisite script failed for this client" "Warning"
+                            $script.Execution_Status = "Skipped"
+                            $script.Error_Message = "Skipped: a prerequisite script failed for client '$($script.Client_Name)' in this feature"
+                            $Global:DeploymentResults += $script
+                            Write-Checkpoint -Script $script
+                            $featureSuccess = $false
+                            $featureFailedScripts += $script
+                            continue
+                        }
+
+                        # ── Get connection string ────────────────────────────────────────────────
+                        $connVarName = $script.ConnectionStringVar
+                        $connectionString = (Get-ChildItem Env:$connVarName -ErrorAction SilentlyContinue).Value
+
+                        if (-not $connectionString) {
+                            Write-ScriptExecution "Connection string variable '$connVarName' not set for $($script.SQL_Path)" "Failed"
+                            $script.Execution_Status = "Failed"
+                            $script.Error_Message = "Connection string variable '$connVarName' not found"
+                            $Global:DeploymentResults += $script
+                            Write-Checkpoint -Script $script
+                            $featureSuccess = $false
+                            $featureFailedScripts += $script
+
+                            if ($ClientResilienceMode -eq "ContinueOnClientFailure") {
+                                # Mark client as failed so its subsequent scripts are auto-skipped
+                                $failedClients.Add($script.Client_Name) | Out-Null
+                            }
+                            continue
+                        }
+
+                        # ── Execute script with validation ───────────────────────────────────────
+                        $scriptSuccess = Execute-ScriptWithValidation -Script $script -ConnectionString $connectionString
+
+                        if (-not $scriptSuccess) {
+                            $featureSuccess = $false
+                            $featureFailedScripts += $script
+
+                            # ContinueOnClientFailure: mark client as failed, continue with next client
+                            if ($ClientResilienceMode -eq "ContinueOnClientFailure") {
+                                $failedClients.Add($script.Client_Name) | Out-Null
+                                Write-ScriptExecution "ContinueOnClientFailure - client '$($script.Client_Name)' failed on '$($script.Script_Name)'. Subsequent scripts for this client will be skipped. Continuing with other clients." "Warning"
+                                continue
+                            }
+
+                            # StopOnFirstClientFailure (default): apply the configured rollback strategy
+                            switch ($RollbackStrategy) {
+                                'AtomicFeature' {
+                                    Write-ScriptExecution "AtomicFeature rollback triggered" "Rollback"
+                                    Invoke-FeatureRollback -FeatureScripts $sortedScripts -ApplicationName $ApplicationName -FeatureName $FeatureName
+                                    return $false
+                                }
+                                'Progressive' {
+                                    Write-ScriptExecution "Progressive strategy - continuing with next script" "Warning"
+                                    return $false
+                                }
+                                'CascadingApplication' {
+                                    Write-ScriptExecution "CascadingApplication rollback triggered" "Rollback"
+                                    return $false
+                                }
+                            }
+                        }
+                    }
+
+                    # Track failed features
+                    if (-not $featureSuccess) {
+                        $Global:FailedFeatures += @{
+                            ApplicationName = $ApplicationName
+                            FeatureName     = $FeatureName
+                            FailedScripts   = $featureFailedScripts
+                        }
+                    }
+
+                    # Report any clients that had failures so they are visible in the summary
+                    if ($failedClients.Count -gt 0) {
+                        Write-ScriptExecution "Clients with failures in this feature: $($failedClients -join ', ')" "Warning"
+                        Write-Host "Found $($allScripts.Count) execution plan row(s)" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Error "Failed to read execution plan: $($_.Exception.Message)"
+                        Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
+                        exit 1
+                    }
+
+                    # Apply filters if specified
+                    if ($ApplicationFilter -ne 'all') {
+                        $allScripts = $allScripts | Where-Object { $_.Application_Name -eq $ApplicationFilter }
+                        Write-Host "Filtered to application: $($allScripts.Count) row(s)" -ForegroundColor Green
+                    }
+
+                    if ($FeatureFilter -ne 'all') {
+                        $allScripts = $allScripts | Where-Object { $_.Feature_Name -eq $FeatureFilter }
+                        Write-Host "Filtered to feature: $($allScripts.Count) row(s)" -ForegroundColor Green
+                    }
+
+                    if ($allScripts.Count -eq 0) {
+                        Write-Error "No execution plan rows after applying filters"
+                        Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
+                        exit 1
+                    }
+
+                    $allScripts = @($allScripts)
+                    foreach ($row in $allScripts) {
+                        Initialize-ResultFields -Row $row
+                    }
+
+                    # Group by application and feature for execution
+                    $featureGroups = $allScripts | Group-Object -Property Application_Name, Feature_Name
+
+                    Write-Host ""
+                    Write-Host "Deployment Summary:" -ForegroundColor Yellow
+                    Write-Host "  Total Features: $($featureGroups.Count)" -ForegroundColor Yellow
+                    Write-Host "  Total Execution Rows: $($allScripts.Count)" -ForegroundColor Yellow
+                    Write-Host "  Unique Clients: $(($allScripts | Select-Object -Unique Client_Name).Count)" -ForegroundColor Yellow
+                    Write-Host "  Unique Servers: $(($allScripts | Select-Object -Unique Server_Name).Count)" -ForegroundColor Yellow
+
+                    # Execute deployment
+                    try {
+                        $deploymentSuccess = $true
+
+                        # Sort feature groups by Feature_Order for consistent execution
+                        $sortedFeatureGroups = $featureGroups | ForEach-Object {
+                            $featureOrder = [int]($_.Group[0].Feature_Order)
+                            $_ | Add-Member -MemberType NoteProperty -Name SortOrder -Value $featureOrder -PassThru
+                        } | Sort-Object { [int]$_.SortOrder }
+
+                        foreach ($featureGroup in $sortedFeatureGroups) {
+                            $groupParts = $featureGroup.Name -split ', '
+                            $applicationName = $groupParts[0]
+                            $featureName = $groupParts[1]
+                            $featureScripts = $featureGroup.Group
+
+                            $featureSuccess = Execute-Feature -FeatureScripts $featureScripts `
+                                -ApplicationName $applicationName `
+                                -FeatureName $featureName
+
+                            if (-not $featureSuccess) {
+                                $deploymentSuccess = $false
+
+                                # Handle cascading rollback
+                                if ($RollbackStrategy -eq 'CascadingApplication') {
+                                    Write-ScriptExecution "Cascading rollback for application: $applicationName" "Rollback"
+                                    # Rollback all features of this application
+                                    $appScripts = $Global:DeploymentResults | Where-Object { $_.Application_Name -eq $applicationName }
+                                    $appFeatureGroups = $appScripts | Group-Object -Property Feature_Name
+
+                                    foreach ($appFeatureGroup in $appFeatureGroups) {
+                                        Invoke-FeatureRollback -FeatureScripts $appFeatureGroup.Group `
+                                            -ApplicationName $applicationName `
+                                            -FeatureName $appFeatureGroup.Name
+                                    }
+                                    break
+                                }
+                            }
+                        }
+
+                        # Rows that were never executed (stopped by an earlier failure) are reported as Skipped
+                        foreach ($row in $allScripts) {
+                            if ($row.Execution_Status -eq "Pending") {
+                                $row.Execution_Status = "Skipped"
+                                $row.Error_Message = "Not executed: deployment stopped after an earlier failure ($RollbackStrategy strategy)"
+                            }
+                        }
+
+                        # Generate results
+                        Write-StageHeader "Deployment Results"
+
+                        $executionTime = [math]::Round(((Get-Date) - $Global:ExecutionStartTime).TotalSeconds, 2)
+                        $successfulScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Success" }).Count
+                        $failedScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Failed" -or $_.Execution_Status -eq "Rollback Failed" }).Count
+                        $rolledBackScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Rollback Success" }).Count
+                        $skippedScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Skipped" }).Count
+                        $totalScripts = $allScripts.Count
+
+                        Write-Host "Successful Scripts: $successfulScripts" -ForegroundColor Green
+                        Write-Host "Failed Scripts: $failedScripts" -ForegroundColor Red
+                        Write-Host "Rolled Back Scripts: $rolledBackScripts" -ForegroundColor Magenta
+                        Write-Host "Skipped Scripts: $skippedScripts" -ForegroundColor Yellow
+                        Write-Host "Total Scripts: $totalScripts" -ForegroundColor Yellow
+                        Write-Host "Execution Time: $executionTime seconds" -ForegroundColor Yellow
+
+                        Write-Host ""
+                        Write-Host "Execution Details:" -ForegroundColor Yellow
+                        $allScripts | Format-Table -AutoSize -Property @(
+                            @{ Label = "Script"; Expression = { $_.Script_Name } },
+                            @{ Label = "Client"; Expression = { $_.Client_Name } },
+                            @{ Label = "Server"; Expression = { $_.Server_Name } },
+                            @{ Label = "Database"; Expression = { $_.Database_Name } },
+                            @{ Label = "Status"; Expression = { $_.Execution_Status } },
+                            @{ Label = "Transaction"; Expression = { $_.Transaction_Status } },
+                            @{ Label = "Batches"; Expression = { if ([int]$_.Total_Batches -gt 0) { "$($_.Batches_Executed)/$($_.Total_Batches)" } else { "" } } },
+                            @{ Label = "Duration(s)"; Expression = { $_.Duration } }
+                        ) | Out-String -Width 4096 | Write-Host
+
+                        # Export results: one row per planned script/database, in plan order
+                        $buildId = $env:BUILD_BUILDID
+                        if ([string]::IsNullOrWhiteSpace($buildId)) { $buildId = "local" }
+                        $resultsPath = Join-Path $ArtifactsDirectory "executionsql-results-$buildId.csv"
+
+                        $allScripts | Export-Csv -Path $resultsPath -NoTypeInformation -Force
+                        Write-Host "Results exported to: $resultsPath" -ForegroundColor Green
+
+                        # Report failed features
+                        if ($Global:FailedFeatures.Count -gt 0) {
+                            Write-Host ""
+                            Write-Host "Failed Features:" -ForegroundColor Red
+                            $Global:FailedFeatures | ForEach-Object {
+                                Write-Host "  - $($_.ApplicationName).$($_.FeatureName)" -ForegroundColor Red
+                            }
+                        }
+
+                        # Set pipeline variables
+                        Write-Host ""
+                        Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]$deploymentSuccess"
+                        Write-Host "##vso[task.setvariable variable=SuccessfulScripts;isOutput=true]$successfulScripts"
+                        Write-Host "##vso[task.setvariable variable=FailedScripts;isOutput=true]$failedScripts"
+                        Write-Host "##vso[task.setvariable variable=RolledBackScripts;isOutput=true]$rolledBackScripts"
+                        Write-Host "##vso[task.setvariable variable=SkippedScripts;isOutput=true]$skippedScripts"
+                        Write-Host "##vso[task.setvariable variable=TotalScripts;isOutput=true]$totalScripts"
+                        Write-Host "##vso[task.setvariable variable=ExecutionTime;isOutput=true]$executionTime"
+
+                        if ($deploymentSuccess) {
+                            Write-Host "[SUCCESS] Feature-based SQL Deployment completed successfully" -ForegroundColor Green
+                            exit 0
+                        }
+                        else {
+                            Write-Host "[FAILED] Feature-based SQL Deployment completed with failures" -ForegroundColor Red
+                            exit 1
+                        }
+                    }
+                    catch {
+                        Write-Error "Deployment failed with exception: $($_.Exception.Message)"
+                        Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
+                        exit 1
+                    }                # Export results: one row per planned script/database, in plan order
+                    $buildId = $env:BUILD_BUILDID
+                    if ([string]::IsNullOrWhiteSpace($buildId)) { $buildId = "local" }
+                    $resultsPath = Join-Path $ArtifactsDirectory "executionsql-results-$buildId.csv"
+
+                    $allScripts | Export-Csv -Path $resultsPath -NoTypeInformation -Force
+                    Write-Host "Results exported to: $resultsPath" -ForegroundColor Green
+
+                    # Report failed features
+                    if ($Global:FailedFeatures.Count -gt 0) {
+                        Write-Host ""
+                        Write-Host "Failed Features:" -ForegroundColor Red
+                        $Global:FailedFeatures | ForEach-Object {
+                            Write-Host "  - $($_.ApplicationName).$($_.FeatureName)" -ForegroundColor Red
+                        }
+                    }
+
+                    # Set pipeline variables
+                    Write-Host ""
+                    Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]$deploymentSuccess"
+                    Write-Host "##vso[task.setvariable variable=SuccessfulScripts;isOutput=true]$successfulScripts"
+                    Write-Host "##vso[task.setvariable variable=FailedScripts;isOutput=true]$failedScripts"
+                    Write-Host "##vso[task.setvariable variable=RolledBackScripts;isOutput=true]$rolledBackScripts"
+                    Write-Host "##vso[task.setvariable variable=SkippedScripts;isOutput=true]$skippedScripts"
+                    Write-Host "##vso[task.setvariable variable=TotalScripts;isOutput=true]$totalScripts"
+                    Write-Host "##vso[task.setvariable variable=ExecutionTime;isOutput=true]$executionTime"
+
+                    if ($deploymentSuccess) {
+                        Write-Host "[SUCCESS] Feature-based SQL Deployment completed successfully" -ForegroundColor Green
+                        exit 0
+                    }
+                    else {
+                        Write-Host "[FAILED] Feature-based SQL Deployment completed with failures" -ForegroundColor Red
+                        exit 1
+                    }
                 }
-                'Progressive' {
-                    Write-ScriptExecution "Progressive strategy - continuing with next script" "Warning"
-                    return $false
-                }
-                'CascadingApplication' {
-                    Write-ScriptExecution "CascadingApplication rollback triggered" "Rollback"
-                    return $false
+                catch {
+                    Write-Error "Deployment failed with exception: $($_.Exception.Message)"
+                    Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
+                    exit 1
                 }
             }
         }
-    }
-
-    # Track failed features
-    if (-not $featureSuccess) {
-        $Global:FailedFeatures += @{
-            ApplicationName = $ApplicationName
-            FeatureName     = $FeatureName
-            FailedScripts   = $featureFailedScripts
+        catch {
+            Write-Error "Deployment failed with exception: $($_.Exception.Message)"
+            Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
+            exit 1
         }
     }
-
-    $status = if ($featureSuccess) { "COMPLETED" } else { "FAILED" }
-    Write-ScriptExecution "Feature $status" "Info"
-
-    return $featureSuccess
-}
-
-# Main execution starts here
-Write-StageHeader "Feature-Based SQL Deployment"
-
-Write-Host "Environment: $Environment" -ForegroundColor Yellow
-Write-Host "Release Version: $ReleaseVersion" -ForegroundColor Yellow
-Write-Host "Rollback Strategy: $RollbackStrategy" -ForegroundColor Yellow
-
-if ($ApplicationFilter -ne 'all') {
-    Write-Host "Application Filter: $ApplicationFilter" -ForegroundColor Yellow
-}
-
-if ($FeatureFilter -ne 'all') {
-    Write-Host "Feature Filter: $FeatureFilter" -ForegroundColor Yellow
-}
-
-# Read execution plan
-$executionPlanPath = Join-Path $ArtifactsDirectory "execution_plan.csv"
-
-if (-not (Test-Path $executionPlanPath)) {
-    Write-Error "Execution plan not found at: $executionPlanPath"
-    Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
-    exit 1
-}
-
-Write-Host "Reading execution plan from: $executionPlanPath" -ForegroundColor Yellow
-
-try {
-    $allScripts = Import-Csv -Path $executionPlanPath -ErrorAction Stop
-    Write-Host "Found $($allScripts.Count) execution plan row(s)" -ForegroundColor Green
-}
-catch {
-    Write-Error "Failed to read execution plan: $($_.Exception.Message)"
-    Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
-    exit 1
-}
-
-# Apply filters if specified
-if ($ApplicationFilter -ne 'all') {
-    $allScripts = $allScripts | Where-Object { $_.Application_Name -eq $ApplicationFilter }
-    Write-Host "Filtered to application: $($allScripts.Count) row(s)" -ForegroundColor Green
-}
-
-if ($FeatureFilter -ne 'all') {
-    $allScripts = $allScripts | Where-Object { $_.Feature_Name -eq $FeatureFilter }
-    Write-Host "Filtered to feature: $($allScripts.Count) row(s)" -ForegroundColor Green
-}
-
-if ($allScripts.Count -eq 0) {
-    Write-Error "No execution plan rows after applying filters"
-    Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
-    exit 1
-}
-
-$allScripts = @($allScripts)
-foreach ($row in $allScripts) {
-    Initialize-ResultFields -Row $row
-}
-
-# Group by application and feature for execution
-$featureGroups = $allScripts | Group-Object -Property Application_Name, Feature_Name
-
-Write-Host ""
-Write-Host "Deployment Summary:" -ForegroundColor Yellow
-Write-Host "  Total Features: $($featureGroups.Count)" -ForegroundColor Yellow
-Write-Host "  Total Execution Rows: $($allScripts.Count)" -ForegroundColor Yellow
-Write-Host "  Unique Clients: $(($allScripts | Select-Object -Unique Client_Name).Count)" -ForegroundColor Yellow
-Write-Host "  Unique Servers: $(($allScripts | Select-Object -Unique Server_Name).Count)" -ForegroundColor Yellow
-
-# Execute deployment
-try {
-    $deploymentSuccess = $true
-
-    # Sort feature groups by Feature_Order for consistent execution
-    $sortedFeatureGroups = $featureGroups | ForEach-Object {
-        $featureOrder = [int]($_.Group[0].Feature_Order)
-        $_ | Add-Member -MemberType NoteProperty -Name SortOrder -Value $featureOrder -PassThru
-    } | Sort-Object { [int]$_.SortOrder }
-
-    foreach ($featureGroup in $sortedFeatureGroups) {
-        $groupParts = $featureGroup.Name -split ', '
-        $applicationName = $groupParts[0]
-        $featureName = $groupParts[1]
-        $featureScripts = $featureGroup.Group
-
-        $featureSuccess = Execute-Feature -FeatureScripts $featureScripts `
-            -ApplicationName $applicationName `
-            -FeatureName $featureName
-
-        if (-not $featureSuccess) {
-            $deploymentSuccess = $false
-
-            # Handle cascading rollback
-            if ($RollbackStrategy -eq 'CascadingApplication') {
-                Write-ScriptExecution "Cascading rollback for application: $applicationName" "Rollback"
-                # Rollback all features of this application
-                $appScripts = $Global:DeploymentResults | Where-Object { $_.Application_Name -eq $applicationName }
-                $appFeatureGroups = $appScripts | Group-Object -Property Feature_Name
-
-                foreach ($appFeatureGroup in $appFeatureGroups) {
-                    Invoke-FeatureRollback -FeatureScripts $appFeatureGroup.Group `
-                        -ApplicationName $applicationName `
-                        -FeatureName $appFeatureGroup.Name
-                }
-                break
-            }
-        }
-    }
-
-    # Rows that were never executed (stopped by an earlier failure) are reported as Skipped
-    foreach ($row in $allScripts) {
-        if ($row.Execution_Status -eq "Pending") {
-            $row.Execution_Status = "Skipped"
-            $row.Error_Message = "Not executed: deployment stopped after an earlier failure ($RollbackStrategy strategy)"
-        }
-    }
-
-    # Generate results
-    Write-StageHeader "Deployment Results"
-
-    $executionTime = [math]::Round(((Get-Date) - $Global:ExecutionStartTime).TotalSeconds, 2)
-    $successfulScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Success" }).Count
-    $failedScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Failed" -or $_.Execution_Status -eq "Rollback Failed" }).Count
-    $rolledBackScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Rollback Success" }).Count
-    $skippedScripts = @($allScripts | Where-Object { $_.Execution_Status -eq "Skipped" }).Count
-    $totalScripts = $allScripts.Count
-
-    Write-Host "Successful Scripts: $successfulScripts" -ForegroundColor Green
-    Write-Host "Failed Scripts: $failedScripts" -ForegroundColor Red
-    Write-Host "Rolled Back Scripts: $rolledBackScripts" -ForegroundColor Magenta
-    Write-Host "Skipped Scripts: $skippedScripts" -ForegroundColor Yellow
-    Write-Host "Total Scripts: $totalScripts" -ForegroundColor Yellow
-    Write-Host "Execution Time: $executionTime seconds" -ForegroundColor Yellow
-
-    Write-Host ""
-    Write-Host "Execution Details:" -ForegroundColor Yellow
-    $allScripts | Format-Table -AutoSize -Property @(
-        @{ Label = "Script"; Expression = { $_.Script_Name } },
-        @{ Label = "Client"; Expression = { $_.Client_Name } },
-        @{ Label = "Server"; Expression = { $_.Server_Name } },
-        @{ Label = "Database"; Expression = { $_.Database_Name } },
-        @{ Label = "Status"; Expression = { $_.Execution_Status } },
-        @{ Label = "Transaction"; Expression = { $_.Transaction_Status } },
-        @{ Label = "Batches"; Expression = { if ([int]$_.Total_Batches -gt 0) { "$($_.Batches_Executed)/$($_.Total_Batches)" } else { "" } } },
-        @{ Label = "Duration(s)"; Expression = { $_.Duration } }
-    ) | Out-String -Width 4096 | Write-Host
-
-    # Export results: one row per planned script/database, in plan order
-    $buildId = $env:BUILD_BUILDID
-    if ([string]::IsNullOrWhiteSpace($buildId)) { $buildId = "local" }
-    $resultsPath = Join-Path $ArtifactsDirectory "executionsql-results-$buildId.csv"
-
-    $allScripts | Export-Csv -Path $resultsPath -NoTypeInformation -Force
-    Write-Host "Results exported to: $resultsPath" -ForegroundColor Green
-
-    # Report failed features
-    if ($Global:FailedFeatures.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Failed Features:" -ForegroundColor Red
-        $Global:FailedFeatures | ForEach-Object {
-            Write-Host "  - $($_.ApplicationName).$($_.FeatureName)" -ForegroundColor Red
-        }
-    }
-
-    # Set pipeline variables
-    Write-Host ""
-    Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]$deploymentSuccess"
-    Write-Host "##vso[task.setvariable variable=SuccessfulScripts;isOutput=true]$successfulScripts"
-    Write-Host "##vso[task.setvariable variable=FailedScripts;isOutput=true]$failedScripts"
-    Write-Host "##vso[task.setvariable variable=RolledBackScripts;isOutput=true]$rolledBackScripts"
-    Write-Host "##vso[task.setvariable variable=SkippedScripts;isOutput=true]$skippedScripts"
-    Write-Host "##vso[task.setvariable variable=TotalScripts;isOutput=true]$totalScripts"
-    Write-Host "##vso[task.setvariable variable=ExecutionTime;isOutput=true]$executionTime"
-
-    if ($deploymentSuccess) {
-        Write-Host "✓ Feature-based SQL Deployment completed successfully" -ForegroundColor Green
-        exit 0
-    }
-    else {
-        Write-Host "✗ Feature-based SQL Deployment completed with failures" -ForegroundColor Red
-        exit 1
-    }
-}
-catch {
-    Write-Error "Deployment failed with exception: $($_.Exception.Message)"
-    Write-Host "##vso[task.setvariable variable=DeploymentSuccess;isOutput=true]false"
-    exit 1
 }
