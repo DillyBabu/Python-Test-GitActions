@@ -20,6 +20,12 @@ param(
     [parameter(Mandatory = $false)]
     [string]$ArtifactsDirectory = "$(Join-Path $PWD 'artifacts')",
 
+    # Comma-separated list of Client_Name values to exclude from the execution plan.
+    # Use this when a client has a known issue and must be skipped for this run.
+    # Example: -ExcludedClients "Client5" or -ExcludedClients "Client5,Client8"
+    [parameter(Mandatory = $false)]
+    [string]$ExcludedClients = '',
+
     [parameter(Mandatory = $false)]
     [string]$DryRun = 'true'
 )
@@ -264,6 +270,14 @@ if ($FilteredScripts.Count -eq 0) {
 $SkippedRows = @()
 $ExecutionPlan = @()
 
+# Build the exclusion list from the ExcludedClients parameter
+$excludedList = @()
+if (-not [string]::IsNullOrWhiteSpace($ExcludedClients)) {
+    $excludedList = @($ExcludedClients -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    Write-Host "Excluded clients  : $($excludedList -join ', ')" -ForegroundColor Yellow
+    Write-Host "These clients will be removed from the execution plan at expansion time." -ForegroundColor Yellow
+}
+
 # Expand execution plan for each script based on client configurations
 Write-StageHeader "Expanding Execution Plan by Client and Database"
 
@@ -283,6 +297,17 @@ foreach ($script in $FilteredScripts) {
     $seenTargets = @{}
 
     foreach ($clientId in $clientNames) {
+        # Skip any client that is in the exclusion list
+        if ($excludedList.Count -gt 0 -and $clientId -in $excludedList) {
+            Write-Host "[EXCLUDED] Client '$clientId' skipped for script '$($script.SQL_Path)' (in Excluded_Clients list)" -ForegroundColor Yellow
+            $SkippedRows += @(@{
+                SQL_Path    = $script.SQL_Path
+                Client_Name = $clientId
+                Reason      = "Client excluded via Excluded_Clients parameter"
+            })
+            continue
+        }
+
         $clientConfigs = @(Get-ClientConfiguration -ConfigData $ConfigData -ClientName $clientId -Environment $Environment)
 
         if ($clientConfigs.Count -eq 0) {
@@ -381,6 +406,7 @@ if ($SkippedRows.Count -gt 0) {
 Write-Host "##vso[task.setvariable variable=ExecutionPlanRows;isOutput=true]$($ExecutionPlan.Count)"
 Write-Host "##vso[task.setvariable variable=SkippedRows;isOutput=true]$($SkippedRows.Count)"
 Write-Host "##vso[task.setvariable variable=FeatureCount;isOutput=true]$($featureGroups.Count)"
+Write-Host "##vso[task.setvariable variable=ExcludedClients;isOutput=true]$ExcludedClients"
 Write-Host "##vso[task.setvariable variable=ClientCount;isOutput=true]$(($ExecutionPlan | Select-Object -Unique Client_Name).Count)"
 Write-Host "##vso[task.setvariable variable=ServerCount;isOutput=true]$(($ExecutionPlan | Select-Object -Unique Server_Name).Count)"
 
@@ -390,6 +416,7 @@ $SummaryReport = @{
     "Environment"       = $Environment
     "ApplicationFilter" = $ApplicationFilter
     "FeatureFilter"     = $FeatureFilter
+    "ExcludedClients"   = if ($excludedList.Count -gt 0) { $excludedList -join ',' } else { "" }
     "ExecutionPlanRows" = $ExecutionPlan.Count
     "SkippedRows"       = $SkippedRows.Count
     "FeatureCount"      = $featureGroups.Count
