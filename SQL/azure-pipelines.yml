@@ -1,0 +1,268 @@
+trigger:
+- main
+
+parameters:
+- name: releaseVersion
+  displayName: 'Release_Version'
+  type: string
+
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: 'dev'
+  values: 
+    - dev
+    - qa
+    - PRD
+
+- name: ApplicationFilter
+  displayName: 'Application Filter (Optional)'
+  type: string
+  default: 'all'
+
+- name: FeatureFilter
+  displayName: 'Feature Filter (comma-separated, Optional)'
+  type: string
+  default: 'all'
+  # Use 'all' to include every feature, or provide one or more feature names
+  # separated by commas.  Example: "FeatureA,FeatureB,FeatureC"
+
+- name: RollbackStrategy
+  displayName: 'Rollback Strategy (Optional)'
+  type: string
+  default: 'Progressive'
+  values: 
+    - AtomicFeature
+    - Progressive
+    - CascadingApplication
+
+- name: ClientResilienceMode
+  displayName: 'Client Resilience Mode'
+  type: string
+  default: 'StopOnFirstClientFailure'
+  values:
+    - StopOnFirstClientFailure
+    - ContinueOnClientFailure
+
+- name: Excluded_Clients
+  displayName: 'Excluded Clients (comma-separated, optional)'
+  type: string
+  default: ''
+
+- name: dryRun
+  displayName: 'Dry Run (Optional)'
+  type: boolean
+  default: true 
+    
+variables:
+  - name: 'ChecklistPath'
+    value: '$(System.DefaultWorkingDirectory)/Environments/${{parameters.environment}}/${{parameters.environment}}.csv'
+  - name: 'ConfigFilePath'
+    value: '$(System.DefaultWorkingDirectory)/Environments/${{parameters.environment}}/${{parameters.environment}}-config.json'
+  - name: 'ArtifactsDirectory'
+    value: '$(System.ArtifactsDirectory)'
+
+  # Pool selection based on environment
+  - name: agentPoolName
+    ${{ if eq(parameters.environment, 'dev') }}:
+      value: 'Your-Self-Hosted-Windows-Pool'
+    ${{ if eq(parameters.environment, 'qa') }}:
+      value: 'Your-Self-Hosted-Windows-Pool'
+    ${{ if eq(parameters.environment, 'PRD') }}:
+      value: 'Your-Self-Hosted-Windows-Pool'
+
+
+
+stages:
+- stage: ParseChecklist
+  displayName: 'Parse Feature-Based  Release Checklist'
+  jobs:
+  - job: ReadChecklist
+    displayName: 'Read and Validate Feature Checklist'
+    pool:
+      name: $(agentPoolName)
+    steps:
+    - checkout: self
+
+    - task: PowerShell@2
+      displayName: 'Parse Feature-Based Release Checklist'
+      inputs:
+        targetType: 'filePath'
+        filePath: 'Scripts/Parse_FeatureChecklist.ps1'
+        arguments: >
+          -ChecklistPath "$(ChecklistPath)"
+          -ConfigFilePath "$(ConfigFilePath)"
+          -Environment "${{parameters.environment}}"
+          -ReleaseVersion "${{parameters.releaseVersion}}"
+          -ApplicationFilter "${{parameters.ApplicationFilter}}"
+          -FeatureFilter "${{parameters.FeatureFilter}}"
+          -ArtifactsDirectory "$(ArtifactsDirectory)"
+          -ExcludedClients "${{parameters.Excluded_Clients}}"
+          -DryRun "${{parameters.dryRun}}"
+        pwsh: false
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+      name: 'parseStep'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Execution Plan'
+      condition: succeeded()
+      inputs:
+        targetPath: '$(System.ArtifactsDirectory)'
+        artifactName: 'ExecutionPlan'
+        publishLocation: 'pipeline'
+
+- stage: ValidateScripts
+  displayName: 'Validate SQL Scripts'
+  dependsOn: ParseChecklist
+  condition: |
+    and(
+      succeeded('ParseChecklist'),
+      eq('${{parameters.dryRun}}', false)
+    )
+  variables:
+    - name: executionPlanRows
+      value: $[ stageDependencies.ParseChecklist.ReadChecklist.outputs['parseStep.ExecutionPlanRows']]
+    - name: FeatureCount
+      value: $[ stageDependencies.ParseChecklist.ReadChecklist.outputs['parseStep.FeatureCount']]
+    - name: FeatureList
+      value: $[ stageDependencies.ParseChecklist.ReadChecklist.outputs['parseStep.FeatureList']]
+
+  jobs:
+  - job: ValidateSQL
+    displayName: 'Validate SQL Syntax'
+    pool:
+      name: $(agentPoolName)
+    steps:
+    - checkout: self
+    
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifactName: 'ExecutionPlan'
+        path: '$(Pipeline.Workspace)\ExecutionPlan'
+    
+    - task: PowerShell@2
+      displayName: 'Validate SQL Scripts'
+      condition: gt(variables['executionPlanRows'], 0 )
+      inputs:
+        targetType: 'filePath'
+        filePath: 'scripts/Validate-SQLScripts.ps1'
+        arguments: >
+          -ArtifactsDirectory "$(Pipeline.Workspace)\ExecutionPlan"
+          -Environment ${{parameters.environment}}
+          -EnableAdvancedValidation $true
+        pwsh: false
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+      name: ValidateStep
+
+- stage: ExecuteScripts
+  displayName: 'Execute Feature Based SQL Scripts'
+  dependsOn: [ParseChecklist, ValidateScripts]
+  variables:
+    - name: executionPlanRows
+      value: $[ stageDependencies.ParseChecklist.ReadChecklist.outputs['parseStep.ExecutionPlanRows'] ]
+    -  name: FeatureCount
+       value: $[ stageDependencies.ParseChecklist.ReadChecklist.outputs['parseStep.FeatureCount'] ]
+    - name: FeatureList
+      value: $[ stageDependencies.ParseChecklist.ReadChecklist.outputs['parseStep.FeatureList'] ]
+    - name: validationStatus
+      value: $[ stageDependencies.ValidateScripts.ValidateSQL.outputs['ValidateStep.validationStatus'] ]
+
+  jobs:
+  - job: ManualApproval
+    displayName: 'Manual Approval'
+    pool:
+      name: $(agentPoolName)
+    steps:
+    - checkout: self
+    - task: ManualValidation@1
+      displayName: 'Manual Approval'
+      condition: and(succeeded(), gt(variables['executionPlanRows'], 0 ), eq(variables['validationStatus'], 'Success'))
+      inputs:
+        notifyUsers: 'me@myemail.com'
+        instructions: |
+          Please validate the execution plan and approve or reject the deployment.
+          Click 'Resume' to approve or 'Reject' to reject the deployment.
+
+  - deployment: DeployToDatabase
+    displayName: 'Deploy SQL Scripts by Feature'
+    dependsOn: ManualApproval
+    environment: ${{parameters.environment}}
+    pool:
+      name: $(agentPoolName)
+    variables:
+    - group: 'mssql-vg-dev'
+    strategy: 
+      runOnce: 
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Execution Plan'
+            inputs:
+              artifactName: 'ExecutionPlan'
+              path: '$(System.DefaultWorkingDirectory)'
+          
+          - task: PowerShell@2
+            displayName: 'Execute Feature-Based SQL Deployment Script'
+            condition: gt(variables['executionPlanRows'], 0 )
+            env:
+              # Map secret variables from 'mssql-vg-dev' library group to environment variables.
+              # The variable name here (left side) must match the ConnectionStringVar column
+              # value in your execution_plan.csv so the script can resolve it via:
+              #   Get-ChildItem Env:$connVarName
+              CONN_STR_CLIENTA: $(CONN_STR_CLIENTA)   # secret: ClientA connection string
+              CONN_STR_CLIENTB: $(CONN_STR_CLIENTB)   # secret: ClientB connection string
+            inputs:
+              targetType: 'filePath'
+              filePath: 'scripts/Deploy-FeatureBasedSQL.ps1'
+              arguments: >
+                -ChecklistPath "$(ChecklistPath)"
+                -ConfigFilePath "$(ConfigFilePath)"
+                -ArtifactsDirectory "$(ArtifactsDirectory)"
+                -Environment "${{parameters.environment}}"
+                -ReleaseVersion "${{parameters.releaseVersion}}"
+                -ApplicationFilter "${{parameters.ApplicationFilter}}"
+                -FeatureFilter "${{parameters.FeatureFilter}}"
+                -RollbackStrategy "${{parameters.RollbackStrategy}}"
+                -ClientResilienceMode "${{parameters.ClientResilienceMode}}"
+              pwsh: false
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+            name: 'deployStep'
+          
+          - task: PowerShell@2
+            displayName: 'Publish Deployment Results'
+            condition: always()
+            inputs:
+              targetType: 'filePath'
+              filePath: 'scripts/Publish-DeploymentResults.ps1'
+              arguments: >
+                -workingDirectory "$(System.DefaultWorkingDirectory)"
+                -ArtifactsDirectory "$(System.ArtifactsDirectory)"
+                -Environment "${{parameters.environment}}"
+                -ReleaseVersion "${{parameters.releaseVersion}}"
+                -GenerateDetailedReport $true
+              pwsh: false
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+            name: 'publishStep'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Deployment Results'
+            condition: always()
+            inputs:
+              PathtoPublish: '$(System.ArtifactsDirectory)'
+              ArtifactName: 'ExecutionResults'
+
+          - task: PowerShell@2
+            displayName: 'Fail Pipeline If Deployment Failed'
+            condition: always()
+            inputs:
+              targetType: 'inline'
+              script: |
+                $deploymentSuccess = "$(deploymentSuccess)"
+
+                if ($deploymentSuccess -eq 'False') {
+                  Write-Error "Deploymen contain failures. Check deployment Arttifacts. "
+                  Exit 1
+                }
+                
