@@ -254,10 +254,11 @@ if ($ApplicationFilter -ne 'all') {
     $FilteredScripts = $FilteredScripts | Where-Object { $_.Application_Name -eq $ApplicationFilter }
 }
 
-# Apply optional Feature Filter
+# Apply optional Feature Filter (supports comma-separated values)
 if ($FeatureFilter -ne 'all') {
-    Write-Host "Applying Feature Filter: $FeatureFilter" -ForegroundColor Cyan
-    $FilteredScripts = $FilteredScripts | Where-Object { $_.Feature_Name -eq $FeatureFilter }
+    $featureList = @($FeatureFilter -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    Write-Host "Applying Feature Filter: $($featureList -join ', ') ($($featureList.Count) feature(s))" -ForegroundColor Cyan
+    $FilteredScripts = $FilteredScripts | Where-Object { $_.Feature_Name -in $featureList }
 }
 
 if ($FilteredScripts.Count -eq 0) {
@@ -402,10 +403,15 @@ if ($SkippedRows.Count -gt 0) {
     }
 }
 
+# Build comma-separated list of distinct feature names from the execution plan
+$distinctFeatures = @($ExecutionPlan | Select-Object -ExpandProperty Feature_Name -Unique | Sort-Object)
+$featureListCsv = $distinctFeatures -join ','
+
 # Output variables for pipeline
 Write-Host "##vso[task.setvariable variable=ExecutionPlanRows;isOutput=true]$($ExecutionPlan.Count)"
 Write-Host "##vso[task.setvariable variable=SkippedRows;isOutput=true]$($SkippedRows.Count)"
 Write-Host "##vso[task.setvariable variable=FeatureCount;isOutput=true]$($featureGroups.Count)"
+Write-Host "##vso[task.setvariable variable=FeatureList;isOutput=true]$featureListCsv"
 Write-Host "##vso[task.setvariable variable=ExcludedClients;isOutput=true]$ExcludedClients"
 Write-Host "##vso[task.setvariable variable=ClientCount;isOutput=true]$(($ExecutionPlan | Select-Object -Unique Client_Name).Count)"
 Write-Host "##vso[task.setvariable variable=ServerCount;isOutput=true]$(($ExecutionPlan | Select-Object -Unique Server_Name).Count)"
@@ -420,6 +426,7 @@ $SummaryReport = @{
     "ExecutionPlanRows" = $ExecutionPlan.Count
     "SkippedRows"       = $SkippedRows.Count
     "FeatureCount"      = $featureGroups.Count
+    "FeatureList"       = $featureListCsv
     "ClientCount"       = ($ExecutionPlan | Select-Object -Unique Client_Name).Count
     "ServerCount"       = ($ExecutionPlan | Select-Object -Unique Server_Name).Count
     "ProcessingTime"    = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
