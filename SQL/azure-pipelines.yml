@@ -45,7 +45,12 @@ parameters:
     - ContinueOnClientFailure
 
 - name: Excluded_Clients
-  displayName: 'Excluded Clients (comma-separated, optional)'
+  displayName: 'Excluded Clients - clientIds or clientNames (comma-separated, optional)'
+  type: string
+  default: ''
+
+- name: Exclude_Exceptions
+  displayName: 'Exclude Exceptions - clientIds to keep (comma-separated, optional)'
   type: string
   default: ''
 
@@ -98,6 +103,7 @@ stages:
           -FeatureFilter "${{parameters.FeatureFilter}}"
           -ArtifactsDirectory "$(ArtifactsDirectory)"
           -ExcludedClients "${{parameters.Excluded_Clients}}"
+          -ExcludeExceptions "${{parameters.Exclude_Exceptions}}"
           -DryRun "${{parameters.dryRun}}"
         pwsh: false
         workingDirectory: '$(System.DefaultWorkingDirectory)'
@@ -259,10 +265,11 @@ stages:
             inputs:
               targetType: 'inline'
               script: |
-                $deploymentSuccess = "$(deploymentSuccess)"
+                # Output variable of the deployStep task (set with isOutput=true)
+                $deploymentSuccess = "$(deployStep.DeploymentSuccess)"
 
                 if ($deploymentSuccess -eq 'False') {
-                  Write-Error "Deploymen contain failures. Check deployment Arttifacts. "
+                  Write-Error "Deployment contains failures. Check the deployment artifacts."
                   Exit 1
                 }
                 

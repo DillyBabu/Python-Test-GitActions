@@ -20,11 +20,25 @@ param(
     [parameter(Mandatory = $false)]
     [string]$ArtifactsDirectory = "$(Join-Path $PWD 'artifacts')",
 
-    # Comma-separated list of Client_Name values to exclude from the execution plan.
+    # Comma-separated list of clients to exclude from the execution plan.
     # Use this when a client has a known issue and must be skipped for this run.
-    # Example: -ExcludedClients "Client5" or -ExcludedClients "Client5,Client8"
+    # Each value can be either:
+    #   - a clientId from the servers section of the config (e.g. "C003")
+    #       -> every database tagged with that clientId is skipped, including databases
+    #          reached through group entries such as "WorkflowSecondaryServer"
+    #   - a clientName from the config (e.g. "Client003" or "WorkflowSecondaryServer")
+    #       -> only that config entry is skipped (other entries pointing at the same
+    #          databases are NOT affected - use the clientId to skip a client everywhere)
+    # Example: -ExcludedClients "C003" or -ExcludedClients "WorkflowSecondaryServer,C002"
     [parameter(Mandatory = $false)]
     [string]$ExcludedClients = '',
+
+    # Comma-separated list of clientIds to keep even though ExcludedClients covers them.
+    # Exceptions always win over exclusions.
+    # Example: -ExcludedClients "WorkflowSecondaryServer" -ExcludeExceptions "C004"
+    #   -> skips the WorkflowSecondaryServer group except the database(s) tagged C004
+    [parameter(Mandatory = $false)]
+    [string]$ExcludeExceptions = '',
 
     [parameter(Mandatory = $false)]
     [string]$DryRun = 'true'
@@ -56,14 +70,49 @@ function Get-ClientConfiguration {
     return $clientConfigs
 }
 
+function Split-CommaList {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return @() }
+    return @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function New-SkippedRow {
+    param(
+        [string]$SqlPath,
+        [string]$ClientName,
+        [string]$ClientId = '',
+        [string]$ServerName = '',
+        [string]$DatabaseName = '',
+        [string]$Reason
+    )
+
+    # PSCustomObject (not hashtable) so Export-Csv / Format-Table show real columns
+    return [PSCustomObject]@{
+        SQL_Path      = $SqlPath
+        Client_Name   = $ClientName
+        Client_Id     = $ClientId
+        Server_Name   = $ServerName
+        Database_Name = $DatabaseName
+        Reason        = $Reason
+    }
+}
+
 function Expand-ExecutionPlanForClient {
     param(
         [object]$ScriptRow,
         [object[]]$ClientConfigs,
-        [hashtable]$SeenTargets
+        [hashtable]$SeenTargets,
+        # Values from -ExcludedClients; matched against each server's clientId
+        [string[]]$ExcludedList = @(),
+        # Values from -ExcludeExceptions; servers with these clientIds are always kept
+        [string[]]$ExceptionList = @(),
+        # True when the config entry itself (clientName) is in the exclusion list
+        [bool]$EntryExcluded = $false
     )
 
     $expandedRows = @()
+    $skippedRows = @()
 
     foreach ($clientConfig in $ClientConfigs) {
         if (-not $clientConfig.servers) {
@@ -77,6 +126,34 @@ function Expand-ExecutionPlanForClient {
             if ($databases.Count -eq 0) {
                 Write-Warning "No databases found for server $($server.serverName) in client $($clientConfig.clientName)"
                 continue
+            }
+
+            # Exclusion check per server, based on the server's clientId.
+            # Runs before the duplicate-target check so an excluded target does not block
+            # another (non-excluded) client in the same Client_Name list from deploying it.
+            $serverClientId = [string]$server.clientId
+            $isException = $serverClientId -and ($ExceptionList -contains $serverClientId)
+            $excludeReason = $null
+
+            if (-not $isException) {
+                if ($EntryExcluded) {
+                    $excludeReason = "Client '$($clientConfig.clientName)' excluded via Excluded_Clients parameter"
+                }
+                elseif ($serverClientId -and ($ExcludedList -contains $serverClientId)) {
+                    $excludeReason = "ClientId '$serverClientId' excluded via Excluded_Clients parameter"
+                }
+            }
+
+            if ($excludeReason) {
+                foreach ($database in $databases) {
+                    Write-Host "[EXCLUDED] $($server.serverName)/$database (client '$($clientConfig.clientName)', clientId '$serverClientId') skipped for script '$($ScriptRow.SQL_Path)'" -ForegroundColor Yellow
+                    $skippedRows += New-SkippedRow -SqlPath $ScriptRow.SQL_Path -ClientName $clientConfig.clientName -ClientId $serverClientId -ServerName $server.serverName -DatabaseName $database -Reason $excludeReason
+                }
+                continue
+            }
+
+            if ($EntryExcluded -and $isException) {
+                Write-Host "[EXCEPTION] Keeping $($server.serverName) (clientId '$serverClientId') of excluded client '$($clientConfig.clientName)' (in Exclude_Exceptions list)" -ForegroundColor Cyan
             }
 
             foreach ($database in $databases) {
@@ -94,7 +171,10 @@ function Expand-ExecutionPlanForClient {
         }
     }
 
-    return $expandedRows
+    return [PSCustomObject]@{
+        Rows    = $expandedRows
+        Skipped = $skippedRows
+    }
 }
 
 function Get-ExpandedRow {
@@ -271,12 +351,54 @@ if ($FilteredScripts.Count -eq 0) {
 $SkippedRows = @()
 $ExecutionPlan = @()
 
-# Build the exclusion list from the ExcludedClients parameter
-$excludedList = @()
-if (-not [string]::IsNullOrWhiteSpace($ExcludedClients)) {
-    $excludedList = @($ExcludedClients -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+# Build the exclusion / exception lists from the ExcludedClients and ExcludeExceptions parameters
+$excludedList = @(Split-CommaList -Value $ExcludedClients)
+$exceptionList = @(Split-CommaList -Value $ExcludeExceptions)
+
+if ($excludedList.Count -gt 0) {
     Write-Host "Excluded clients  : $($excludedList -join ', ')" -ForegroundColor Yellow
+    if ($exceptionList.Count -gt 0) {
+        Write-Host "Exclude exceptions: $($exceptionList -join ', ')" -ForegroundColor Yellow
+    }
     Write-Host "These clients will be removed from the execution plan at expansion time." -ForegroundColor Yellow
+
+    # Validate every value against the config so typos do not silently deploy to a client
+    $allServers = @($ConfigData | ForEach-Object { $_.servers })
+    $knownClientIds = @($allServers | ForEach-Object { [string]$_.clientId } | Where-Object { $_ } | Select-Object -Unique)
+    $knownClientNames = @($ConfigData | ForEach-Object { [string]$_.clientName } | Select-Object -Unique)
+
+    if (@($allServers | Where-Object { [string]::IsNullOrWhiteSpace($_.clientId) }).Count -gt 0) {
+        Write-Warning "Some servers in $ConfigFilePath have no clientId - they can only be excluded by clientName"
+    }
+
+    foreach ($value in $excludedList) {
+        $isClientId = $knownClientIds -contains $value
+        $isClientName = $knownClientNames -contains $value
+
+        if (-not $isClientId -and -not $isClientName) {
+            Write-Warning "Excluded value '$value' does not match any clientName or clientId in $ConfigFilePath"
+            continue
+        }
+
+        if ($isClientName) {
+            # Excluding by name only skips that entry - point out where its databases may still be deployed
+            $entryIds = @($ConfigData | Where-Object { $_.clientName -eq $value } | ForEach-Object { $_.servers } |
+                ForEach-Object { [string]$_.clientId } | Where-Object { $_ } | Select-Object -Unique)
+            $notExcludedIds = @($entryIds | Where-Object { $excludedList -notcontains $_ })
+            if ($notExcludedIds.Count -gt 0) {
+                Write-Host "Note: '$value' skips only the '$value' config entry. Other entries that point at clientId(s) $($notExcludedIds -join ', ') are not affected - exclude the clientId to skip it everywhere." -ForegroundColor DarkYellow
+            }
+        }
+    }
+
+    foreach ($value in $exceptionList) {
+        if ($knownClientIds -notcontains $value) {
+            Write-Warning "Exception value '$value' does not match any clientId in $ConfigFilePath (exceptions must be clientIds)"
+        }
+    }
+}
+elseif ($exceptionList.Count -gt 0) {
+    Write-Warning "ExcludeExceptions '$($exceptionList -join ', ')' ignored because ExcludedClients is empty"
 }
 
 # Expand execution plan for each script based on client configurations
@@ -287,47 +409,48 @@ foreach ($script in $FilteredScripts) {
 
     if ([string]::IsNullOrWhiteSpace($clientName)) {
         Write-Warning "Skipping row - Client_Name is empty for script: $($script.SQL_Path)"
-        $SkippedRows += @($script)
+        $SkippedRows += New-SkippedRow -SqlPath $script.SQL_Path -ClientName '' -Reason "Client_Name is empty in checklist"
         continue
     }
 
     # Handle comma-separated client names
-    $clientNames = @($clientName -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $clientNames = @(Split-CommaList -Value $clientName)
 
     # Server/database targets already planned for this script row (prevents double deployment)
     $seenTargets = @{}
 
-    foreach ($clientId in $clientNames) {
-        # Skip any client that is in the exclusion list
-        if ($excludedList.Count -gt 0 -and $clientId -in $excludedList) {
-            Write-Host "[EXCLUDED] Client '$clientId' skipped for script '$($script.SQL_Path)' (in Excluded_Clients list)" -ForegroundColor Yellow
-            $SkippedRows += @(@{
-                SQL_Path    = $script.SQL_Path
-                Client_Name = $clientId
-                Reason      = "Client excluded via Excluded_Clients parameter"
-            })
+    foreach ($currentClient in $clientNames) {
+        $entryExcluded = $excludedList -contains $currentClient
+
+        # Whole entry excluded and no exceptions to honour - skip without expanding
+        if ($entryExcluded -and $exceptionList.Count -eq 0) {
+            Write-Host "[EXCLUDED] Client '$currentClient' skipped for script '$($script.SQL_Path)' (in Excluded_Clients list)" -ForegroundColor Yellow
+            $SkippedRows += New-SkippedRow -SqlPath $script.SQL_Path -ClientName $currentClient -Reason "Client excluded via Excluded_Clients parameter"
             continue
         }
 
-        $clientConfigs = @(Get-ClientConfiguration -ConfigData $ConfigData -ClientName $clientId -Environment $Environment)
+        $clientConfigs = @(Get-ClientConfiguration -ConfigData $ConfigData -ClientName $currentClient -Environment $Environment)
 
         if ($clientConfigs.Count -eq 0) {
-            Write-Warning "Client '$clientId' not found in configuration - skipping this client for script $($script.SQL_Path)"
-            $SkippedRows += @(@{
-                    SQL_Path    = $script.SQL_Path
-                    Client_Name = $clientId
-                    Reason      = "Client not found in configuration"
-                })
+            Write-Warning "Client '$currentClient' not found in configuration - skipping this client for script $($script.SQL_Path)"
+            $SkippedRows += New-SkippedRow -SqlPath $script.SQL_Path -ClientName $currentClient -Reason "Client not found in configuration"
             continue
         }
 
-        $expandedRows = @(Expand-ExecutionPlanForClient -ScriptRow $script -ClientConfigs $clientConfigs -SeenTargets $seenTargets)
+        # Per-server exclusion by clientId (and exceptions) is applied inside the expansion
+        $expansion = Expand-ExecutionPlanForClient -ScriptRow $script -ClientConfigs $clientConfigs -SeenTargets $seenTargets `
+            -ExcludedList $excludedList -ExceptionList $exceptionList -EntryExcluded $entryExcluded
+
+        $expandedRows = @($expansion.Rows)
         if ($expandedRows.Count -gt 0) {
             $ExecutionPlan += $expandedRows
         }
+        if (@($expansion.Skipped).Count -gt 0) {
+            $SkippedRows += @($expansion.Skipped)
+        }
 
         $targets = ($expandedRows | ForEach-Object { "$($_.Server_Name)/$($_.Database_Name)" }) -join ', '
-        Write-Host "Expanded script $($script.SQL_Path) for client '$clientId' to $($expandedRows.Count) database(s): $targets" -ForegroundColor Cyan
+        Write-Host "Expanded script $($script.SQL_Path) for client '$currentClient' to $($expandedRows.Count) database(s): $targets" -ForegroundColor Cyan
     }
 }
 
@@ -368,6 +491,8 @@ if ($VarDryRun) {
     Write-Host "Release Version: $ReleaseVersion"
     Write-Host "Application Filter: $ApplicationFilter"
     Write-Host "Feature Filter: $FeatureFilter"
+    Write-Host "Excluded Clients: $($excludedList -join ', ')"
+    Write-Host "Exclude Exceptions: $($exceptionList -join ', ')"
     Write-Host "Total Execution Plan Rows: $($ExecutionPlan.Count)" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Sample Execution Plan (first 10 rows):" -ForegroundColor Yellow
@@ -423,6 +548,7 @@ $SummaryReport = @{
     "ApplicationFilter" = $ApplicationFilter
     "FeatureFilter"     = $FeatureFilter
     "ExcludedClients"   = if ($excludedList.Count -gt 0) { $excludedList -join ',' } else { "" }
+    "ExcludeExceptions" = if ($exceptionList.Count -gt 0) { $exceptionList -join ',' } else { "" }
     "ExecutionPlanRows" = $ExecutionPlan.Count
     "SkippedRows"       = $SkippedRows.Count
     "FeatureCount"      = $featureGroups.Count

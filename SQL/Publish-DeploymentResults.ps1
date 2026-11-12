@@ -72,6 +72,53 @@ function Get-DurationSum {
     return [math]::Round($total, 2)
 }
 
+# Groups the skip reasons written by Deploy-FeatureBasedSQL.ps1
+function Get-SkipCategory {
+    param([string]$Reason)
+
+    if ($Reason -match 'failed in earlier feature') { return 'Database failed in an earlier feature' }
+    if ($Reason -match 'earlier script failed') { return 'Earlier script failed in the same feature' }
+    if ($Reason -match 'deployment stopped') { return 'Deployment stopped after a failure' }
+    return 'Other'
+}
+
+# Overall outcome of a set of rows (one database, one feature, ...)
+function Get-OutcomeLabel {
+    param([array]$Rows)
+
+    $total = @($Rows).Count
+    $success = Get-CategoryCount -Rows $Rows -Category 'Success'
+    $failed = (Get-CategoryCount -Rows $Rows -Category 'Failed') + (Get-CategoryCount -Rows $Rows -Category 'RollbackFailed')
+    $rolledBack = Get-CategoryCount -Rows $Rows -Category 'RolledBack'
+
+    if ($total -gt 0 -and $success -eq $total) { return 'Deployed' }
+    if ($failed -gt 0) {
+        if ($success -gt 0) { return 'Failed - partially deployed' }
+        if ($rolledBack -gt 0) { return 'Failed - rolled back' }
+        return 'Failed'
+    }
+    if ($rolledBack -gt 0) { return 'Rolled back' }
+    if ($success -eq 0) { return 'Not deployed (skipped)' }
+    return 'Partially deployed'
+}
+
+function Get-OutcomeBadge {
+    param([string]$Outcome)
+
+    $class = switch -Wildcard ($Outcome) {
+        'Deployed'     { 'ok' }
+        'Failed*'      { 'fail' }
+        'Not deployed*' { 'skip' }
+        default        { 'warn' }
+    }
+    return "<span class=""badge $class"">$(ConvertTo-HtmlText $Outcome)</span>"
+}
+
+function Get-TargetName {
+    param([object]$Row)
+    return "$($Row.Client_Name) ($($Row.Server_Name).$($Row.Database_Name))"
+}
+
 function Get-DeploymentStatistics {
     param([array]$Results)
 
@@ -86,6 +133,7 @@ function Get-DeploymentStatistics {
         AverageDuration       = 0
         Applications          = @($Results | Group-Object -Property Application_Name).Count
         Features              = @($Results | Group-Object -Property Application_Name, Feature_Name).Count
+        Clients               = @($Results | Group-Object -Property Client_Name).Count
         Servers               = @($Results | Group-Object -Property Server_Name).Count
         Databases             = @($Results | Group-Object -Property Server_Name, Database_Name).Count
     }
@@ -123,50 +171,78 @@ function New-ExecutionSummary {
         Status             = $status
     }
 
-    # Server / Database breakdown
+    # Server / Database breakdown - one row per deployment target, with its outcome across all features
     $summary.ServerBreakdown = @($Results | Group-Object -Property Server_Name, Database_Name | ForEach-Object {
             $rows = @($_.Group)
+            $firstFailure = @($rows | Where-Object {
+                    $category = Get-StatusCategory $_.Execution_Status
+                    $category -eq 'Failed' -or $category -eq 'RollbackFailed'
+                } | Sort-Object -Property @{ Expression = { [int]$_.Feature_Order } }, @{ Expression = { [int]$_.Script_Order } }) | Select-Object -First 1
             [ordered]@{
                 ServerName     = $rows[0].Server_Name
                 DatabaseName   = $rows[0].Database_Name
-                Clients        = (@($rows | Select-Object -ExpandProperty Client_Name -Unique) -join ', ')
+                Clients        = (@($rows | Select-Object -ExpandProperty Client_Name -Unique | Sort-Object) -join ', ')
                 TotalScripts   = $rows.Count
                 Successful     = Get-CategoryCount -Rows $rows -Category 'Success'
                 Failed         = (Get-CategoryCount -Rows $rows -Category 'Failed') + (Get-CategoryCount -Rows $rows -Category 'RollbackFailed')
                 RolledBack     = Get-CategoryCount -Rows $rows -Category 'RolledBack'
                 Skipped        = Get-CategoryCount -Rows $rows -Category 'Skipped'
                 Duration       = Get-DurationSum -Rows $rows
+                Outcome        = Get-OutcomeLabel -Rows $rows
+                FirstFailure   = if ($firstFailure) { "$($firstFailure.Feature_Name) / $($firstFailure.Script_Name)" } else { "" }
             }
-        })
+        } | Sort-Object -Property @{ Expression = { $_.Clients } }, @{ Expression = { $_.ServerName } }, @{ Expression = { $_.DatabaseName } })
 
     # Application breakdown
     $summary.ApplicationBreakdown = @($Results | Group-Object -Property Application_Name | ForEach-Object {
             $rows = @($_.Group)
             [ordered]@{
                 ApplicationName   = $_.Name
-                Features          = @($rows | Select-Object -Property Feature_Name -Unique).Count
+                Features          = @($rows | Select-Object -ExpandProperty Feature_Name -Unique).Count
                 TotalScripts      = $rows.Count
                 SuccessfulScripts = Get-CategoryCount -Rows $rows -Category 'Success'
                 FailedScripts     = (Get-CategoryCount -Rows $rows -Category 'Failed') + (Get-CategoryCount -Rows $rows -Category 'RollbackFailed')
+                RolledBackScripts = Get-CategoryCount -Rows $rows -Category 'RolledBack'
+                SkippedScripts    = Get-CategoryCount -Rows $rows -Category 'Skipped'
                 Duration          = Get-DurationSum -Rows $rows
             }
         })
 
-    # Feature breakdown
+    # Feature breakdown, in deployment order (Feature_Order)
     $summary.FeatureBreakdown = @($Results | Group-Object -Property Application_Name, Feature_Name | ForEach-Object {
             $rows = @($_.Group)
             $started = @($rows | Where-Object { $_.Start_Time } | Sort-Object -Property Start_Time)
+            $failedTargets = @($rows | Where-Object {
+                    $category = Get-StatusCategory $_.Execution_Status
+                    $category -eq 'Failed' -or $category -eq 'RollbackFailed'
+                } | ForEach-Object { Get-TargetName -Row $_ } | Select-Object -Unique)
             [ordered]@{
+                FeatureOrder      = $rows[0].Feature_Order
                 ApplicationName   = $rows[0].Application_Name
                 FeatureName       = $rows[0].Feature_Name
+                Clients           = @($rows | Select-Object -ExpandProperty Client_Name -Unique).Count
                 TotalScripts      = $rows.Count
                 SuccessfulScripts = Get-CategoryCount -Rows $rows -Category 'Success'
                 FailedScripts     = (Get-CategoryCount -Rows $rows -Category 'Failed') + (Get-CategoryCount -Rows $rows -Category 'RollbackFailed')
+                RolledBackScripts = Get-CategoryCount -Rows $rows -Category 'RolledBack'
+                SkippedScripts    = Get-CategoryCount -Rows $rows -Category 'Skipped'
                 Duration          = Get-DurationSum -Rows $rows
+                Outcome           = Get-OutcomeLabel -Rows $rows
+                FailedTargets     = ($failedTargets -join ', ')
                 FirstExecuted     = if ($started.Count -gt 0) { $started[0].Start_Time } else { "" }
                 LastExecuted      = if ($started.Count -gt 0) { $started[$started.Count - 1].End_Time } else { "" }
             }
-        })
+        } | Sort-Object -Property @{ Expression = { [int]$_.FeatureOrder } }, @{ Expression = { $_.ApplicationName } }, @{ Expression = { $_.FeatureName } })
+
+    # Why scripts were skipped (ContinueOnClientFailure skips per database, StopOnFirstClientFailure stops the run)
+    $summary.SkipBreakdown = @($Results | Where-Object { (Get-StatusCategory $_.Execution_Status) -eq 'Skipped' } |
+        Group-Object -Property { Get-SkipCategory -Reason $_.Error_Message } | ForEach-Object {
+            [ordered]@{
+                Reason  = $_.Name
+                Count   = $_.Count
+                Targets = (@($_.Group | ForEach-Object { Get-TargetName -Row $_ } | Select-Object -Unique) -join ', ')
+            }
+        } | Sort-Object -Property @{ Expression = { $_.Count } } -Descending)
 
     return $summary
 }
@@ -352,10 +428,11 @@ function New-HtmlReport {
         @{ Label = 'Total Scripts'; Value = $stats.TotalScripts; Class = '' },
         @{ Label = 'Succeeded'; Value = $stats.SuccessfulScripts; Class = 't-ok' },
         @{ Label = 'Failed'; Value = $stats.FailedScripts; Class = 't-fail' },
-        @{ Label = 'Rolled Back (feature)'; Value = $stats.RolledBackScripts; Class = 't-warn' },
+        @{ Label = 'Rolled Back'; Value = $stats.RolledBackScripts; Class = 't-warn' },
         @{ Label = 'Rollback Failed'; Value = $stats.RollbackFailedScripts; Class = 't-fail' },
         @{ Label = 'Skipped'; Value = $stats.SkippedScripts; Class = 't-skip' },
         @{ Label = 'Success Rate'; Value = "$($Summary.SuccessRate)%"; Class = '' },
+        @{ Label = 'Clients'; Value = $stats.Clients; Class = '' },
         @{ Label = 'Servers / Databases'; Value = "$($stats.Servers) / $($stats.Databases)"; Class = '' },
         @{ Label = 'Total Duration'; Value = "$($stats.TotalDuration)s"; Class = '' }
     )
@@ -364,15 +441,27 @@ function New-HtmlReport {
     }
     [void]$sb.AppendLine("</div>")
 
-    # Server / Database summary
+    # Client / Database summary (one row per deployment target)
     [void]$sb.AppendLine(@"
-<h2>Server / Database Summary</h2>
+<h2>Client / Database Summary</h2>
 <table>
-    <tr><th>Server</th><th>Database</th><th>Client(s)</th><th>Scripts</th><th>Succeeded</th><th>Failed</th><th>Rolled Back</th><th>Skipped</th><th>Duration (s)</th></tr>
+    <tr><th>Client(s)</th><th>Server</th><th>Database</th><th>Outcome</th><th>First Failure (feature / script)</th><th>Scripts</th><th>Succeeded</th><th>Failed</th><th>Rolled Back</th><th>Skipped</th><th>Duration (s)</th></tr>
 "@)
     foreach ($server in $Summary.ServerBreakdown) {
         $rowClass = if ($server.Failed -gt 0) { ' class="row-fail"' } else { '' }
-        [void]$sb.AppendLine("<tr$rowClass><td>$(ConvertTo-HtmlText $server.ServerName)</td><td>$(ConvertTo-HtmlText $server.DatabaseName)</td><td>$(ConvertTo-HtmlText $server.Clients)</td><td class=""num"">$($server.TotalScripts)</td><td class=""num t-ok"">$($server.Successful)</td><td class=""num t-fail"">$($server.Failed)</td><td class=""num t-warn"">$($server.RolledBack)</td><td class=""num t-skip"">$($server.Skipped)</td><td class=""num"">$($server.Duration)</td></tr>")
+        [void]$sb.AppendLine("<tr$rowClass><td>$(ConvertTo-HtmlText $server.Clients)</td><td>$(ConvertTo-HtmlText $server.ServerName)</td><td>$(ConvertTo-HtmlText $server.DatabaseName)</td><td>$(Get-OutcomeBadge $server.Outcome)</td><td>$(ConvertTo-HtmlText (Get-DisplayValue $server.FirstFailure))</td><td class=""num"">$($server.TotalScripts)</td><td class=""num t-ok"">$($server.Successful)</td><td class=""num t-fail"">$($server.Failed)</td><td class=""num t-warn"">$($server.RolledBack)</td><td class=""num t-skip"">$($server.Skipped)</td><td class=""num"">$($server.Duration)</td></tr>")
+    }
+    [void]$sb.AppendLine("</table>")
+
+    # Feature summary, in deployment order
+    [void]$sb.AppendLine(@"
+<h2>Feature Summary (deployment order)</h2>
+<table>
+    <tr><th>Order</th><th>Application</th><th>Feature</th><th>Outcome</th><th>Clients</th><th>Scripts</th><th>Succeeded</th><th>Failed</th><th>Rolled Back</th><th>Skipped</th><th>Failed Client(s)</th><th>Duration (s)</th></tr>
+"@)
+    foreach ($feature in $Summary.FeatureBreakdown) {
+        $rowClass = if ($feature.FailedScripts -gt 0) { ' class="row-fail"' } else { '' }
+        [void]$sb.AppendLine("<tr$rowClass><td class=""num"">$(ConvertTo-HtmlText $feature.FeatureOrder)</td><td>$(ConvertTo-HtmlText $feature.ApplicationName)</td><td>$(ConvertTo-HtmlText $feature.FeatureName)</td><td>$(Get-OutcomeBadge $feature.Outcome)</td><td class=""num"">$($feature.Clients)</td><td class=""num"">$($feature.TotalScripts)</td><td class=""num t-ok"">$($feature.SuccessfulScripts)</td><td class=""num t-fail"">$($feature.FailedScripts)</td><td class=""num t-warn"">$($feature.RolledBackScripts)</td><td class=""num t-skip"">$($feature.SkippedScripts)</td><td>$(ConvertTo-HtmlText (Get-DisplayValue $feature.FailedTargets))</td><td class=""num"">$($feature.Duration)</td></tr>")
     }
     [void]$sb.AppendLine("</table>")
 
@@ -380,12 +469,25 @@ function New-HtmlReport {
     [void]$sb.AppendLine(@"
 <h2>Application Summary</h2>
 <table>
-    <tr><th>Application</th><th>Features</th><th>Scripts</th><th>Succeeded</th><th>Failed</th><th>Duration (s)</th></tr>
+    <tr><th>Application</th><th>Features</th><th>Scripts</th><th>Succeeded</th><th>Failed</th><th>Rolled Back</th><th>Skipped</th><th>Duration (s)</th></tr>
 "@)
     foreach ($app in $Summary.ApplicationBreakdown) {
-        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $app.ApplicationName)</td><td class=""num"">$($app.Features)</td><td class=""num"">$($app.TotalScripts)</td><td class=""num t-ok"">$($app.SuccessfulScripts)</td><td class=""num t-fail"">$($app.FailedScripts)</td><td class=""num"">$($app.Duration)</td></tr>")
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $app.ApplicationName)</td><td class=""num"">$($app.Features)</td><td class=""num"">$($app.TotalScripts)</td><td class=""num t-ok"">$($app.SuccessfulScripts)</td><td class=""num t-fail"">$($app.FailedScripts)</td><td class=""num t-warn"">$($app.RolledBackScripts)</td><td class=""num t-skip"">$($app.SkippedScripts)</td><td class=""num"">$($app.Duration)</td></tr>")
     }
     [void]$sb.AppendLine("</table>")
+
+    # Skipped scripts, grouped by reason
+    if ($Summary.SkipBreakdown.Count -gt 0) {
+        [void]$sb.AppendLine(@"
+<h2>Skipped Scripts</h2>
+<table>
+    <tr><th>Reason</th><th>Scripts</th><th>Client / Database</th></tr>
+"@)
+        foreach ($skip in $Summary.SkipBreakdown) {
+            [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $skip.Reason)</td><td class=""num"">$($skip.Count)</td><td>$(ConvertTo-HtmlText $skip.Targets)</td></tr>")
+        }
+        [void]$sb.AppendLine("</table>")
+    }
 
     # Every script execution
     [void]$sb.AppendLine(@"
@@ -410,9 +512,9 @@ function New-HtmlReport {
         [void]$sb.AppendLine(@"
     <tr$rowClass>
         <td class="num">$index</td>
-        <td>$(ConvertTo-HtmlText $r.Application_Name)<div class="path">$(ConvertTo-HtmlText $r.Feature_Name)</div></td>
+        <td>$(ConvertTo-HtmlText $r.Application_Name)<div class="path">$(ConvertTo-HtmlText $r.Feature_Order). $(ConvertTo-HtmlText $r.Feature_Name)</div></td>
         <td>$(ConvertTo-HtmlText (Get-DisplayValue $r.Client_Name))</td>
-        <td><strong>$(ConvertTo-HtmlText (Get-DisplayValue $r.Script_Name))</strong><div class="path">$(ConvertTo-HtmlText $r.SQL_Path)</div></td>
+        <td><strong>$(ConvertTo-HtmlText $r.Script_Order). $(ConvertTo-HtmlText (Get-DisplayValue $r.Script_Name))</strong><div class="path">$(ConvertTo-HtmlText $r.SQL_Path)</div></td>
         <td>$(Get-TargetCell -Planned $r.Server_Name -Actual $r.Actual_Server)</td>
         <td>$(Get-TargetCell -Planned $r.Database_Name -Actual $r.Actual_Database)</td>
         <td>$(Get-StatusBadge $r.Execution_Status)</td>
@@ -533,10 +635,23 @@ if ($deploymentResults.Count -gt 0) {
     Write-Host "Applications: $($statistics.Applications) | Features: $($statistics.Features) | Servers: $($statistics.Servers) | Databases: $($statistics.Databases)" -ForegroundColor White
 
     Write-Host ""
-    Write-Host "Server / Database Summary:" -ForegroundColor Cyan
+    Write-Host "Client / Database Summary:" -ForegroundColor Cyan
     $summary.ServerBreakdown | ForEach-Object { [PSCustomObject]$_ } |
-        Format-Table -AutoSize -Property ServerName, DatabaseName, Clients, TotalScripts, Successful, Failed, RolledBack, Skipped, Duration |
+        Format-Table -AutoSize -Property Clients, ServerName, DatabaseName, Outcome, FirstFailure, TotalScripts, Successful, Failed, RolledBack, Skipped, Duration |
         Out-String -Width 4096 | Write-Host
+
+    Write-Host "Feature Summary (deployment order):" -ForegroundColor Cyan
+    $summary.FeatureBreakdown | ForEach-Object { [PSCustomObject]$_ } |
+        Format-Table -AutoSize -Property FeatureOrder, ApplicationName, FeatureName, Outcome, TotalScripts, SuccessfulScripts, FailedScripts, RolledBackScripts, SkippedScripts, FailedTargets |
+        Out-String -Width 4096 | Write-Host
+
+    if ($summary.SkipBreakdown.Count -gt 0) {
+        Write-Host "Skipped Scripts by Reason:" -ForegroundColor Yellow
+        foreach ($skip in $summary.SkipBreakdown) {
+            Write-Host "  $($skip.Reason): $($skip.Count) - $($skip.Targets)" -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
 
     if ($failureAnalysis.HasFailures) {
         Write-Host "Failure Analysis:" -ForegroundColor Red
@@ -573,6 +688,12 @@ if ($deploymentResults.Count -gt 0) {
     Write-Host "##vso[task.setvariable variable=SuccessRate;isOutput=true]$($summary.SuccessRate)"
     Write-Host "##vso[task.setvariable variable=FailedScripts;isOutput=true]$($statistics.FailedScripts + $statistics.RollbackFailedScripts)"
     Write-Host "##vso[task.setvariable variable=TotalScripts;isOutput=true]$($statistics.TotalScripts)"
+}
+else {
+    # Empty or unreadable results file: do not report success by leaving the variables unset
+    Write-Host "##[warning]The results file '$($latestResults.Name)' contains no rows - no report generated."
+    Write-Host "##vso[task.setvariable variable=DeploymentStatus;isOutput=true]Unknown"
+    Write-Host "##vso[task.setvariable variable=TotalScripts;isOutput=true]0"
 }
 
 # List all artifacts created
